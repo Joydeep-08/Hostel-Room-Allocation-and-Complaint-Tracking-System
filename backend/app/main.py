@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 import jwt
@@ -17,6 +17,76 @@ from app.db import engine, get_db
 
 settings = get_settings()
 password_hasher = PasswordHasher()
+DEFAULT_FEE_AMOUNT = 420
+
+
+def ensure_pricing_columns() -> None:
+    with engine.begin() as connection:
+        for table, column in (("rooms", "monthly_amount"), ("beds", "monthly_amount"), ("allocations", "monthly_amount")):
+            try:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} DECIMAL(12,2) NOT NULL DEFAULT 0"))
+            except SQLAlchemyError:
+                continue
+        connection.execute(text("UPDATE rooms SET monthly_amount=420 WHERE monthly_amount=0"))
+        connection.execute(text("UPDATE beds SET monthly_amount=420 WHERE monthly_amount=0"))
+
+
+def initialize_pricing_schema() -> None:
+    ensure_pricing_columns()
+
+
+def ensure_current_invoices(db: Session, resident_id: int | None = None) -> None:
+    period = date.today().strftime("%B %Y")
+    params = {"period": period, "amount": DEFAULT_FEE_AMOUNT, "due_date": date.today().replace(day=5)}
+    filter_sql = "WHERE is_active=1"
+    if resident_id is not None:
+        filter_sql += " AND id=:resident_id"
+        params["resident_id"] = resident_id
+    db.execute(text(f"""
+        INSERT INTO fee_invoices (resident_id, fee_period, amount_due, due_date, status)
+        SELECT id, :period, :amount, :due_date, 'unpaid'
+        FROM residents
+        {filter_sql}
+        ON DUPLICATE KEY UPDATE resident_id=VALUES(resident_id)
+    """), params)
+
+
+def academic_end_date(start_date: date, academic_year: int) -> date:
+    years_remaining = max(1, 5 - academic_year)
+    try:
+        return start_date.replace(year=start_date.year + years_remaining)
+    except ValueError:
+        return start_date.replace(month=2, day=28, year=start_date.year + years_remaining)
+
+
+def auto_assign_unallocated(db: Session, admin_id: int) -> None:
+    residents = db.execute(text("""
+        SELECT r.id, r.academic_year
+        FROM residents r
+        LEFT JOIN allocations a ON a.resident_id=r.id AND a.status='active'
+        WHERE r.is_active=1 AND r.eligibility_status='eligible' AND a.id IS NULL
+        ORDER BY r.id
+    """)).mappings().all()
+    for resident in residents:
+        bed = db.execute(text("""
+            SELECT b.id, b.monthly_amount
+            FROM beds b
+            WHERE b.status='available'
+              AND NOT EXISTS (SELECT 1 FROM allocations a WHERE a.bed_id=b.id AND a.status='active')
+            ORDER BY b.id LIMIT 1 FOR UPDATE
+        """)).mappings().one_or_none()
+        if not bed:
+            break
+        start_date = date.today()
+        end_date = academic_end_date(start_date, resident["academic_year"])
+        db.execute(text("""
+            INSERT INTO allocations (resident_id, bed_id, allocated_by, start_date, end_date, monthly_amount, status)
+            VALUES (:resident_id, :bed_id, :admin_id, :start_date, :end_date, :amount, 'active')
+        """), {"resident_id": resident["id"], "bed_id": bed["id"], "admin_id": admin_id, "start_date": start_date, "end_date": end_date, "amount": bed["monthly_amount"]})
+        db.execute(text("""
+            UPDATE fee_invoices SET amount_due=:amount
+            WHERE resident_id=:resident_id AND status='unpaid' AND fee_period=:period
+        """), {"amount": bed["monthly_amount"], "resident_id": resident["id"], "period": date.today().strftime("%B %Y")})
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 app = FastAPI(
     title=settings.app_name,
@@ -31,6 +101,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.on_event("startup")
+def _startup_pricing_schema() -> None:
+    initialize_pricing_schema()
 
 
 @app.get("/health", tags=["system"])
@@ -83,6 +156,9 @@ class DashboardStats(BaseModel):
     open_complaints: int = 0
     urgent_complaints: int = 0
     outstanding_balance: float = 0
+    total_residents: int = 0
+    resolved_complaints: int = 0
+    in_progress_complaints: int = 0
 
 
 def create_token(user_id: int, role: str) -> str:
@@ -157,7 +233,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict:
                     "password_hash": password_hasher.hash(payload.password),
                 },
             )
-            db.execute(
+            resident_result = db.execute(
                 text("""
                     INSERT INTO residents
                       (user_id, roll_number, full_name, email, phone, course, academic_year, eligibility_status)
@@ -166,8 +242,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict:
                 """),
                 {"user_id": user_result.lastrowid, **payload.model_dump(exclude={"password"})},
             )
+            ensure_current_invoices(db, resident_result.lastrowid)
         user = db.execute(
-            text("SELECT id, full_name, email, role FROM users WHERE id=:id"),
+            text("SELECT u.id, u.full_name, u.email, u.role, r.id AS resident_id FROM users u LEFT JOIN residents r ON r.user_id=u.id WHERE u.id=:id"),
             {"id": user_result.lastrowid},
         ).mappings().one()
     except HTTPException:
@@ -199,17 +276,40 @@ def dashboard_stats(_: dict = Depends(current_user), db: Session = Depends(get_d
               (SELECT COUNT(*) FROM beds WHERE status = 'available') available_beds,
               (SELECT COUNT(*) FROM complaints WHERE status NOT IN ('resolved', 'closed')) open_complaints,
               (SELECT COUNT(*) FROM complaints WHERE priority = 'urgent' AND status NOT IN ('resolved', 'closed')) urgent_complaints,
+              (SELECT COUNT(*) FROM complaints WHERE status IN ('resolved', 'closed')) resolved_complaints,
+              (SELECT COUNT(*) FROM complaints WHERE status IN ('assigned', 'in_progress')) in_progress_complaints,
               (SELECT COALESCE(SUM(i.amount_due - COALESCE(p.paid, 0)), 0)
                  FROM fee_invoices i
                  LEFT JOIN (SELECT invoice_id, SUM(amount) paid FROM payments GROUP BY invoice_id) p
                    ON p.invoice_id = i.id
-                WHERE i.status <> 'cancelled') outstanding_balance
+                WHERE i.status <> 'cancelled') outstanding_balance,
+              (SELECT COUNT(*) FROM residents WHERE is_active = 1) total_residents
         """)).mappings().one()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Dashboard data is unavailable") from exc
     total = int(row["beds"] or 0)
     occupied = int(row["occupied_beds"] or 0)
     return DashboardStats(**row, occupancy_percent=round(occupied / total * 100, 1) if total else 0)
+
+
+@app.get("/api/dashboard/activity")
+def dashboard_activity(_: dict = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    return [dict(row) for row in db.execute(text("""
+        SELECT 'Allocation' AS type, CONCAT('Allocation for ', r.full_name) AS title,
+               CONCAT('Room ', rm.room_number, ', Bed ', b.bed_number) AS description,
+               a.created_at AS occurred_at
+        FROM allocations a JOIN residents r ON r.id=a.resident_id
+        JOIN beds b ON b.id=a.bed_id JOIN rooms rm ON rm.id=b.room_id
+        UNION ALL
+        SELECT 'Complaint', CONCAT('Complaint: ', subject), status, submitted_at
+        FROM complaints
+        UNION ALL
+        SELECT 'Payment', CONCAT('Payment received from ', r.full_name),
+               CONCAT('₹', p.amount), p.paid_at
+        FROM payments p JOIN fee_invoices i ON i.id=p.invoice_id
+        JOIN residents r ON r.id=i.resident_id
+        ORDER BY occurred_at DESC LIMIT 6
+    """)).mappings().all()]
 
 
 @app.get("/complaints")
@@ -244,10 +344,14 @@ def residents(_: dict = Depends(current_user), db: Session = Depends(get_db)) ->
 
 @app.get("/allocations")
 @app.get("/api/allocations")
-def allocations(_: dict = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+def allocations(user: dict = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    if user["role"] == "administrator":
+        auto_assign_unallocated(db, user["id"])
+        db.commit()
     return [dict(row) for row in db.execute(text("""
         SELECT a.id, res.full_name AS resident_name, h.name AS hostel,
-               r.room_number, b.bed_number, a.start_date, a.end_date, a.status
+               r.room_number, b.bed_number, a.start_date, a.end_date, a.status,
+               a.monthly_amount
         FROM allocations a JOIN residents res ON res.id=a.resident_id
         JOIN beds b ON b.id=a.bed_id JOIN rooms r ON r.id=b.room_id
         JOIN hostels h ON h.id=r.hostel_id ORDER BY a.start_date DESC LIMIT 100
@@ -313,12 +417,17 @@ class RoomCreate(BaseModel):
     room_number: str = Field(min_length=1, max_length=20)
     floor: int
     room_type: str = "double"
+    monthly_amount: float = Field(ge=0)
+    bed_number: str | None = None
+    bed_amount: float | None = Field(default=None, ge=0)
+    bed_count: int = Field(default=1, ge=1, le=100)
 
 
 class BedCreate(BaseModel):
     room_id: int
     bed_number: str = Field(min_length=1, max_length=20)
     status: str = "available"
+    monthly_amount: float = Field(ge=0)
 
 
 def require_admin(user: dict) -> dict:
@@ -354,9 +463,10 @@ def create_hostel(payload: HostelCreate, user: dict = Depends(current_user), db:
 @app.get("/api/rooms")
 def rooms(_: dict = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
     return [dict(row) for row in db.execute(text("""
-        SELECT r.id, r.room_number, r.floor, r.room_type, h.name AS hostel,
-               COUNT(b.id) beds, SUM(b.status='available') available_beds,
-               SUM(a.status='active') occupied_beds
+    SELECT r.id, r.room_number, r.floor, r.room_type, r.monthly_amount, h.name AS hostel,
+               COUNT(b.id) beds, COALESCE(SUM(b.status='available'), 0) available_beds,
+               COALESCE(MIN(b.monthly_amount), r.monthly_amount) bed_monthly_amount,
+               COUNT(a.id) occupied_beds
         FROM rooms r JOIN hostels h ON h.id=r.hostel_id
         LEFT JOIN beds b ON b.room_id=r.id
         LEFT JOIN allocations a ON a.bed_id=b.id AND a.status='active'
@@ -368,7 +478,18 @@ def rooms(_: dict = Depends(current_user), db: Session = Depends(get_db)) -> lis
 def create_room(payload: RoomCreate, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_admin(user)
     try:
-        result = db.execute(text("INSERT INTO rooms (hostel_id, room_number, floor, room_type) VALUES (:hostel_id, :room_number, :floor, :room_type)"), payload.model_dump())
+        result = db.execute(text("INSERT INTO rooms (hostel_id, room_number, floor, room_type, monthly_amount) VALUES (:hostel_id, :room_number, :floor, :room_type, :monthly_amount)"), payload.model_dump())
+        if payload.bed_number:
+            first_bed = payload.bed_number.strip()
+            numeric_bed = first_bed.isdigit()
+            for offset in range(payload.bed_count):
+                if numeric_bed:
+                    bed_number = str(int(first_bed) + offset)
+                elif len(first_bed) == 1 and first_bed.isalpha():
+                    bed_number = chr(ord(first_bed.upper()) + offset)
+                else:
+                    bed_number = first_bed if offset == 0 else f"{first_bed}-{offset + 1}"
+                db.execute(text("INSERT INTO beds (room_id, bed_number, status, monthly_amount) VALUES (:room_id, :bed_number, 'available', :bed_amount)"), {"room_id": result.lastrowid, "bed_number": bed_number, "bed_amount": payload.bed_amount if payload.bed_amount is not None else payload.monthly_amount})
         db.commit()
         return {"id": result.lastrowid, **payload.model_dump()}
     except SQLAlchemyError as exc:
@@ -404,8 +525,9 @@ def delete_room(room_id: int, user: dict = Depends(current_user), db: Session = 
 @app.get("/api/beds")
 def beds(_: dict = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
     return [dict(row) for row in db.execute(text("""
-        SELECT b.id, b.bed_number, b.status, r.room_number, h.name AS hostel,
-               a.resident_id, res.full_name AS resident_name
+        SELECT b.id, b.bed_number, b.status, b.monthly_amount, r.room_number, h.name AS hostel,
+               a.resident_id, res.full_name AS resident_name,
+               CASE WHEN b.status = 'available' AND a.id IS NULL THEN 1 ELSE 0 END AS available_for_allocation
         FROM beds b JOIN rooms r ON r.id=b.room_id JOIN hostels h ON h.id=r.hostel_id
         LEFT JOIN allocations a ON a.bed_id=b.id AND a.status='active'
         LEFT JOIN residents res ON res.id=a.resident_id
@@ -419,7 +541,7 @@ def create_bed(payload: BedCreate, user: dict = Depends(current_user), db: Sessi
     if payload.status not in {"available", "maintenance", "retired"}:
         raise HTTPException(status_code=422, detail="Invalid bed status")
     try:
-        result = db.execute(text("INSERT INTO beds (room_id, bed_number, status) VALUES (:room_id, :bed_number, :status)"), payload.model_dump())
+        result = db.execute(text("INSERT INTO beds (room_id, bed_number, status, monthly_amount) VALUES (:room_id, :bed_number, :status, :monthly_amount)"), payload.model_dump())
         db.commit()
         return {"id": result.lastrowid, **payload.model_dump()}
     except SQLAlchemyError as exc:
@@ -435,6 +557,7 @@ def create_resident(payload: ResidentCreate, user: dict = Depends(current_user),
             INSERT INTO residents (roll_number, full_name, email, phone, course, academic_year, eligibility_status)
             VALUES (:roll_number, :full_name, :email, :phone, :course, :academic_year, 'eligible')
         """), payload.model_dump())
+        ensure_current_invoices(db, row.lastrowid)
         db.commit()
         return {"id": row.lastrowid, **payload.model_dump(), "eligibility_status": "eligible"}
     except SQLAlchemyError as exc:
@@ -442,25 +565,64 @@ def create_resident(payload: ResidentCreate, user: dict = Depends(current_user),
         raise HTTPException(status_code=409, detail="Resident could not be created; check unique fields") from exc
 
 
+@app.delete("/api/residents/{resident_id}")
+def delete_resident(resident_id: int, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    require_admin(user)
+    try:
+        resident = db.execute(
+            text("SELECT id FROM residents WHERE id=:id FOR UPDATE"),
+            {"id": resident_id},
+        ).first()
+        if not resident:
+            raise HTTPException(status_code=404, detail="Resident not found")
+
+        allocation_ids = db.execute(
+            text("SELECT id FROM allocations WHERE resident_id=:resident_id"),
+            {"resident_id": resident_id},
+        ).scalars().all()
+        for allocation_id in allocation_ids:
+            db.execute(
+                text("DELETE FROM room_transfers WHERE from_allocation_id=:id OR to_allocation_id=:id"),
+                {"id": allocation_id},
+            )
+        db.execute(text("DELETE FROM complaint_updates WHERE complaint_id IN (SELECT id FROM complaints WHERE resident_id=:id)"), {"id": resident_id})
+        db.execute(text("DELETE FROM complaints WHERE resident_id=:id"), {"id": resident_id})
+        db.execute(text("DELETE FROM payments WHERE invoice_id IN (SELECT id FROM fee_invoices WHERE resident_id=:id)"), {"id": resident_id})
+        db.execute(text("DELETE FROM fee_invoices WHERE resident_id=:id"), {"id": resident_id})
+        db.execute(text("DELETE FROM allocations WHERE resident_id=:id"), {"id": resident_id})
+        db.execute(text("DELETE FROM residents WHERE id=:id"), {"id": resident_id})
+        db.commit()
+        return {"id": resident_id, "deleted": True}
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Resident could not be removed") from exc
+
+
 @app.post("/api/allocations", status_code=201)
 def allocate(payload: AllocationCreate, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_admin(user)
     try:
-        resident = db.execute(text("SELECT id, eligibility_status FROM residents WHERE id=:id FOR UPDATE"), {"id": payload.resident_id}).mappings().one_or_none()
-        bed = db.execute(text("SELECT id, status FROM beds WHERE id=:id FOR UPDATE"), {"id": payload.bed_id}).mappings().one_or_none()
+        resident = db.execute(text("SELECT id, eligibility_status, academic_year FROM residents WHERE id=:id FOR UPDATE"), {"id": payload.resident_id}).mappings().one_or_none()
+        bed = db.execute(text("SELECT id, status, monthly_amount FROM beds WHERE id=:id FOR UPDATE"), {"id": payload.bed_id}).mappings().one_or_none()
         if not resident or resident["eligibility_status"] != "eligible":
-            raise HTTPException(status_code=422, detail="Resident is not eligible")
+            raise HTTPException(status_code=409, detail="Resident is not eligible for allocation")
         if not bed or bed["status"] != "available":
             raise HTTPException(status_code=409, detail="Bed is unavailable")
         existing = db.execute(text("SELECT id FROM allocations WHERE resident_id=:resident_id AND status='active'"), {"resident_id": payload.resident_id}).first()
         if existing:
             raise HTTPException(status_code=409, detail="Resident already has an active allocation")
+        start_date = date.fromisoformat(payload.start_date)
+        end_date = academic_end_date(start_date, resident["academic_year"])
         row = db.execute(text("""
-            INSERT INTO allocations (resident_id, bed_id, allocated_by, start_date, status)
-            VALUES (:resident_id, :bed_id, :admin_id, :start_date, 'active')
-        """), {**payload.model_dump(), "admin_id": user["id"]})
+            INSERT INTO allocations (resident_id, bed_id, allocated_by, start_date, end_date, monthly_amount, status)
+            VALUES (:resident_id, :bed_id, :admin_id, :start_date, :end_date, :monthly_amount, 'active')
+        """), {"resident_id": payload.resident_id, "bed_id": payload.bed_id, "admin_id": user["id"], "start_date": start_date, "end_date": end_date, "monthly_amount": bed["monthly_amount"]})
+        db.execute(text("UPDATE fee_invoices SET amount_due=:amount WHERE resident_id=:resident_id AND status='unpaid' AND fee_period=:period"), {"amount": bed["monthly_amount"], "resident_id": payload.resident_id, "period": date.today().strftime("%B %Y")})
         db.commit()
-        return {"id": row.lastrowid, **payload.model_dump(), "status": "active"}
+        return {"id": row.lastrowid, "resident_id": payload.resident_id, "bed_id": payload.bed_id, "start_date": start_date, "end_date": end_date, "monthly_amount": bed["monthly_amount"], "status": "active"}
     except HTTPException:
         db.rollback()
         raise
@@ -520,6 +682,8 @@ def transfer(allocation_id: int, payload: TransferCreate, user: dict = Depends(c
 def create_complaint(payload: ComplaintCreate, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     if user["role"] == "resident" and payload.resident_id != user.get("resident_id"):
         raise HTTPException(status_code=403, detail="Residents may only submit their own complaints")
+    if payload.category not in {"electrical", "plumbing", "cleaning", "furniture", "internet", "security", "other"}:
+        raise HTTPException(status_code=422, detail="Invalid complaint category")
     if payload.priority not in {"low", "medium", "high", "urgent"}:
         raise HTTPException(status_code=422, detail="Invalid complaint priority")
     try:
@@ -612,6 +776,63 @@ def record_payment(invoice_id: int, payload: PaymentCreate, user: dict = Depends
         raise HTTPException(status_code=409, detail="Payment could not be recorded") from exc
 
 
+@app.post("/api/invoices/{invoice_id}/mark-paid", status_code=201)
+def mark_invoice_paid(invoice_id: int, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    require_admin(user)
+    try:
+        invoice = db.execute(
+            text("SELECT id, amount_due FROM fee_invoices WHERE id=:id FOR UPDATE"),
+            {"id": invoice_id},
+        ).mappings().one_or_none()
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+        paid = db.execute(
+            text("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id=:id"),
+            {"id": invoice_id},
+        ).scalar_one()
+        outstanding = float(invoice["amount_due"]) - float(paid)
+        if outstanding <= 0:
+            raise HTTPException(status_code=409, detail="Invoice is already paid")
+        reference = f"ADMIN-PAID-{invoice_id}-{uuid4().hex[:10].upper()}"
+        db.execute(
+            text("INSERT INTO payments (invoice_id, recorded_by, amount, payment_reference) VALUES (:invoice_id, :user_id, :amount, :reference)"),
+            {"invoice_id": invoice_id, "user_id": user["id"], "amount": outstanding, "reference": reference},
+        )
+        db.execute(text("UPDATE fee_invoices SET status='paid' WHERE id=:id"), {"id": invoice_id})
+        db.commit()
+        return {"invoice_id": invoice_id, "amount": outstanding, "payment_reference": reference, "invoice_status": "paid"}
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Invoice could not be marked as paid") from exc
+
+
+@app.post("/api/invoices/{invoice_id}/remove-payment")
+def remove_invoice_payment(invoice_id: int, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    require_admin(user)
+    try:
+        invoice = db.execute(
+            text("SELECT id, status FROM fee_invoices WHERE id=:id FOR UPDATE"),
+            {"id": invoice_id},
+        ).mappings().one_or_none()
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+        if invoice["status"] not in {"paid", "partially_paid"}:
+            raise HTTPException(status_code=409, detail="Invoice has no payment to remove")
+        db.execute(text("DELETE FROM payments WHERE invoice_id=:id"), {"id": invoice_id})
+        db.execute(text("UPDATE fee_invoices SET status='unpaid' WHERE id=:id"), {"id": invoice_id})
+        db.commit()
+        return {"invoice_id": invoice_id, "invoice_status": "unpaid"}
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Payment status could not be removed") from exc
+
+
 @app.delete("/api/invoices/{invoice_id}")
 def delete_invoice(invoice_id: int, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_admin(user)
@@ -632,6 +853,9 @@ def delete_invoice(invoice_id: int, user: dict = Depends(current_user), db: Sess
 @app.get("/api/invoices")
 @app.get("/fees")
 def invoices(user: dict = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    resident_id = user.get("resident_id") if user["role"] == "resident" else None
+    ensure_current_invoices(db, resident_id)
+    db.commit()
     query = """
         SELECT i.id, i.fee_period, i.amount_due, i.due_date, i.status,
                r.full_name AS resident_name, COALESCE(SUM(p.amount), 0) AS paid,
@@ -641,7 +865,6 @@ def invoices(user: dict = Depends(current_user), db: Session = Depends(get_db)) 
         WHERE (:resident_id IS NULL OR i.resident_id = :resident_id)
         GROUP BY i.id ORDER BY i.due_date DESC
     """
-    resident_id = user.get("resident_id") if user["role"] == "resident" else None
     return [dict(row) for row in db.execute(text(query), {"resident_id": resident_id}).mappings().all()]
 
 

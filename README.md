@@ -1,6 +1,6 @@
 # Hostel Room Allocation and Complaint Tracking System
 
-This repository starts with **Phase 1: database design** for a normalized hostel administration system. The planned implementation uses React/Vite and Tailwind CSS on the frontend, FastAPI and SQLAlchemy on the backend, and MySQL 8/InnoDB as the authoritative database.
+This repository contains a working hostel administration system using React/Vite on the frontend, FastAPI and SQLAlchemy on the backend, and MySQL 8/InnoDB as the authoritative database.
 
 ## Repository structure
 
@@ -20,7 +20,7 @@ frontend/
   package.json       # Vite frontend scripts and dependencies
 ```
 
-## Phase 1 setup and verification
+## Database setup and verification
 
 Requirements: MySQL 8.x and the MySQL client.
 
@@ -33,7 +33,7 @@ mysql -u root -p hostel_management -e "SHOW TABLES; SELECT COUNT(*) AS beds FROM
 
 The sample password hashes are deliberately synthetic placeholders and are not valid production credentials. The authentication phase will generate real Argon2 hashes and will never commit secrets.
 
-## Backend foundation
+## Backend
 
 ```bash
 cd backend
@@ -63,7 +63,7 @@ Run the current backend test with:
 PYTHONPATH=. pytest
 ```
 
-## Frontend dashboard
+## Frontend
 
 ```bash
 cd frontend
@@ -71,17 +71,21 @@ npm install
 npm run dev
 ```
 
-The dashboard is available at `http://localhost:5173`. Set `VITE_API_URL` when the API is not running on `http://localhost:8000`. Dashboard cards intentionally show an unavailable state until a valid bearer token and database-backed API are available; no demo statistics are presented as live data.
+The dashboard is available at `http://localhost:5173`. Set `VITE_API_URL` when the API is not running on `http://localhost:8000`. Dashboard cards and activity use authenticated, database-backed API data.
 
-## Current MVP API
+## Implemented workflows
 
 - `POST /api/auth/login` — OAuth2 form login with JWT access token.
+- `POST /api/auth/register` — resident self-registration.
 - `GET /api/auth/me` — current authenticated user.
 - `GET /api/dashboard/stats` — database-calculated occupancy, complaint, and fee statistics.
-- `GET /api/residents` — active residents and current allocation state.
-- `GET /api/complaints` — prioritized complaint queue.
-
-The broader workflows (allocation writes, transfers, complaint updates, invoices, payments, and role-specific management screens) remain the next implementation increment; the database schema already supports them transactionally.
+- Resident, room, bed, allocation, complaint, invoice, and payment CRUD workflows.
+- Administrator-only deletion and fee status controls.
+- Resident-only complaint submission and fee payment.
+- Room, bed, and allocation monthly pricing in rupees.
+- Automatic current-period unpaid invoices and allocation-dependent fee amounts.
+- Academic-year allocation end dates and live dashboard activity/statistics.
+- Conflict and authorization alerts in the frontend for invalid or unauthorized actions.
 
 ## DBMS concepts demonstrated
 
@@ -91,6 +95,17 @@ The broader workflows (allocation writes, transfers, complaint updates, invoices
 - `INNER JOIN`, `LEFT JOIN`, `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, aggregates, `EXISTS`, and generated-column unique indexes.
 - Allocation integrity through generated active keys, row-level locking in the future API service, and a cross-table maintenance trigger.
 
-## Remaining phases
+## Verification
 
-Backend models/migrations and API, authentication/authorization, transactional allocation and transfers, complaints/payments/notifications, React dashboard and feature pages, automated tests, and deployment documentation will be added incrementally. No deployment or test success is claimed yet.
+Backend tests and the frontend production build can be run with:
+
+```bash
+cd backend
+PYTHONPATH=. .venv/bin/pytest -q
+PYTHONPATH=. .venv/bin/python -m py_compile app/main.py
+
+cd ../frontend
+npm run build
+```
+
+The application is intended for local development. Deployment configuration is not included.
