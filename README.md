@@ -117,20 +117,22 @@ The repository includes deployment configuration for a free Render backend and a
 - `render.yaml` provisions the FastAPI service from `backend/`.
 - `frontend/vercel.json` keeps React Router routes working on direct page loads.
 
-### 1. Create the AlwaysData MySQL database
+### 1. Create the Aiven MySQL database
 
-Create a MySQL database and user in AlwaysData, then load the schema and sample data from a local terminal:
+Create a MySQL service in Aiven using its free plan. Create or select a database named `hostel_management`, then load the schema and sample data from a local terminal:
 
 ```bash
 mysql -h YOUR_HOST -P YOUR_PORT -u YOUR_USER -p YOUR_DATABASE < database/schema.sql
 mysql -h YOUR_HOST -P YOUR_PORT -u YOUR_USER -p YOUR_DATABASE < database/sample_data.sql
 ```
 
-Use the connection values from AlwaysData to form the SQLAlchemy URL:
+Use the connection values from Aiven to form the SQLAlchemy URL:
 
 ```text
 mysql+pymysql://USER:PASSWORD@HOST:PORT/DATABASE
 ```
+
+If Aiven assigns a different database name, replace the first line (`USE hostel_management;`) in both `database/schema.sql` and `database/sample_data.sql` with the assigned name before importing. Do not run `database/reports.sql` unless you want the optional reporting queries.
 
 ### 2. Deploy the backend to Render
 
