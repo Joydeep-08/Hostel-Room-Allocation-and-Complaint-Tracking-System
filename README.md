@@ -108,4 +108,49 @@ cd ../frontend
 npm run build
 ```
 
-The application is intended for local development. Deployment configuration is not included.
+The application supports local development and the free deployment setup below.
+
+## Free deployment
+
+The repository includes deployment configuration for a free Render backend and a Vercel frontend:
+
+- `render.yaml` provisions the FastAPI service from `backend/`.
+- `frontend/vercel.json` keeps React Router routes working on direct page loads.
+
+### 1. Create the AlwaysData MySQL database
+
+Create a MySQL database and user in AlwaysData, then load the schema and sample data from a local terminal:
+
+```bash
+mysql -h YOUR_HOST -P YOUR_PORT -u YOUR_USER -p YOUR_DATABASE < database/schema.sql
+mysql -h YOUR_HOST -P YOUR_PORT -u YOUR_USER -p YOUR_DATABASE < database/sample_data.sql
+```
+
+Use the connection values from AlwaysData to form the SQLAlchemy URL:
+
+```text
+mysql+pymysql://USER:PASSWORD@HOST:PORT/DATABASE
+```
+
+### 2. Deploy the backend to Render
+
+1. Push this repository to GitHub.
+2. In Render, choose **New > Blueprint** and select the repository.
+3. Render detects `render.yaml` and creates the `hostel-management-api` web service.
+4. Set these environment variables on the service:
+   - `DATABASE_URL`: the AlwaysData SQLAlchemy URL.
+   - `CORS_ORIGINS`: the Vercel frontend URL, for example `https://your-app.vercel.app`.
+5. Deploy and open `/health` on the generated Render URL.
+6. Reset the administrator password against the hosted database if needed. Do not commit that password or any secret.
+
+### 3. Deploy the frontend to Vercel
+
+1. In Vercel, choose **Add New > Project** and select the same repository.
+2. Set the project root directory to `frontend`.
+3. Vercel detects Vite and uses `npm run build`.
+4. Add the environment variable:
+   - `VITE_API_URL`: the Render backend URL, without a trailing slash.
+5. Deploy the project.
+6. Copy the Vercel URL back into Render's `CORS_ORIGINS` variable and redeploy the backend.
+
+Free services may sleep, have storage limits, or change their free-tier terms. Never commit `backend/.env`, database credentials, JWT secrets, or administrator passwords.
