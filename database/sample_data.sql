@@ -7,8 +7,8 @@ INSERT INTO users (full_name, email, password_hash, role) VALUES
 ('Imran Ali', 'imran@hostel.local', '$argon2id$v=19$m=65536,t=3,p=4$synthetic-staff-hash', 'maintenance_staff');
 
 INSERT INTO residents (user_id, roll_number, full_name, email, phone, course, academic_year, eligibility_status) VALUES
-(2, 'CS2024001', 'Rahul Verma', 'rahul@hostel.local', '9000000001', 'Computer Science', 3, 'eligible'),
-(3, 'CS2024002', 'Meera Singh', 'meera@hostel.local', '9000000002', 'Computer Science', 2, 'eligible');
+(2, '101', 'Rahul Verma', 'rahul@hostel.local', '9000000001', 'Computer Science', 3, 'eligible'),
+(3, '102', 'Meera Singh', 'meera@hostel.local', '9000000002', 'Computer Science', 2, 'eligible');
 
 INSERT INTO hostels (name, location, description) VALUES
 ('Hostel Block A', 'North Campus', 'Undergraduate residence'),
